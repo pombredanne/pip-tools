@@ -7,8 +7,11 @@
 # Virtualenvs
 .envrc
 .direnv
+.venv
+venv/
 
 # Testing
+.pytest_cache/
 .tox
 htmlcov
 
@@ -17,12 +20,14 @@ build
 dist
 *.egg-info
 .coverage
+.coverage.*
+coverage.xml
 .cache
 
 # IDE
 .idea
-venv/
 
 # Test files
 requirements.in
 requirements.txt
+.eggs/

@@ -1,13 +1,15 @@
-# coding: utf-8
-# flake8: noqa
-from __future__ import (absolute_import, division, print_function,
-                        unicode_literals)
+from __future__ import annotations
 
-import six
+from .pip_compat import (
+    Distribution,
+    canonicalize_name,
+    create_wheel_cache,
+    parse_requirements,
+)
 
-if six.PY2:
-    from .tempfile import TemporaryDirectory
-    from .contextlib import ExitStack
-else:
-    from tempfile import TemporaryDirectory
-    from contextlib import ExitStack
+__all__ = [
+    "Distribution",
+    "parse_requirements",
+    "create_wheel_cache",
+    "canonicalize_name",
+]

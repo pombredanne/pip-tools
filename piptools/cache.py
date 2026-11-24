@@ -1,83 +1,108 @@
-# coding: utf-8
-from __future__ import (absolute_import, division, print_function,
-                        unicode_literals)
+from __future__ import annotations
 
 import json
 import os
+import platform
 import sys
+import typing as _t
+from collections.abc import Iterable
 
-from pkg_resources import Requirement
+from pip._internal.req import InstallRequirement
+from pip._vendor.packaging.requirements import Requirement
 
 from .exceptions import PipToolsError
-from .locations import CACHE_DIR
-from .utils import as_tuple, key_from_req, lookup_table
+from .utils import as_tuple, key_from_req, lookup_table_from_tuples
+
+CacheKey = tuple[str, str]
+CacheLookup = dict[str, list[str]]
+CacheDict = dict[str, CacheLookup]
+
+_PEP425_PY_TAGS = {"cpython": "cp", "pypy": "pp", "ironpython": "ip", "jython": "jy"}
+
+
+def _implementation_name() -> str:
+    """
+    Get Python implementation and version.
+
+    Similar to PEP 425, however the minor version is separated from the major to
+    differentiate "3.10" and "31.0".
+    """
+    implementation_name = platform.python_implementation().lower()
+    implementation = _PEP425_PY_TAGS.get(implementation_name, "??")
+    return "{}{}.{}".format(implementation, *sys.version_info)
 
 
 class CorruptCacheError(PipToolsError):
-    def __init__(self, path):
+    def __init__(self, path: str):
         self.path = path
 
-    def __str__(self):
+    def __str__(self) -> str:
         lines = [
-            'The dependency cache seems to have been corrupted.',
-            'Inspect, or delete, the following file:',
-            '  {}'.format(self.path),
+            "The dependency cache seems to have been corrupted.",
+            "Inspect, or delete, the following file:",
+            f"  {self.path}",
         ]
         return os.linesep.join(lines)
 
 
-def read_cache_file(cache_file_path):
-    with open(cache_file_path, 'r') as cache_file:
+def read_cache_file(cache_file_path: str) -> CacheDict:
+    with open(cache_file_path, encoding="utf-8") as cache_file:
         try:
             doc = json.load(cache_file)
-        except ValueError:
+        except (json.JSONDecodeError, UnicodeDecodeError):
             raise CorruptCacheError(cache_file_path)
 
         # Check version and load the contents
-        assert doc['__format__'] == 1, 'Unknown cache file format'
-        return doc['dependencies']
+        if doc["__format__"] != 1:
+            raise ValueError("Unknown cache file format")
+        return _t.cast(CacheDict, doc["dependencies"])
 
 
-class DependencyCache(object):
+class DependencyCache:
     """
-    Creates a new persistent dependency cache for the current Python version.
+    Create new persistent dependency cache for the current Python version.
+
     The cache file is written to the appropriate user cache dir for the
     current platform, i.e.
 
         ~/.cache/pip-tools/depcache-pyX.Y.json
 
+    Where py indicates the Python implementation.
     Where X.Y indicates the Python version.
     """
-    def __init__(self, cache_dir=None):
-        if cache_dir is None:
-            cache_dir = CACHE_DIR
-        if not os.path.isdir(cache_dir):
-            os.makedirs(cache_dir)
-        py_version = '.'.join(str(digit) for digit in sys.version_info[:2])
-        cache_filename = 'depcache-py{}.json'.format(py_version)
+
+    def __init__(self, cache_dir: str):
+        os.makedirs(cache_dir, exist_ok=True)
+        cache_filename = f"depcache-{_implementation_name()}.json"
 
         self._cache_file = os.path.join(cache_dir, cache_filename)
-        self._cache = None
+        self._cache: CacheDict | None = None
 
     @property
-    def cache(self):
+    def cache(self) -> CacheDict:
         """
         The dictionary that is the actual in-memory cache.  This property
         lazily loads the cache from disk.
         """
         if self._cache is None:
-            self.read_cache()
+            try:
+                self._cache = read_cache_file(self._cache_file)
+            except FileNotFoundError:
+                self._cache = {}
         return self._cache
 
-    def as_cache_key(self, ireq):
+    def as_cache_key(self, ireq: InstallRequirement) -> CacheKey:
         """
-        Given a requirement, return its cache key. This behavior is a little weird in order to allow backwards
-        compatibility with cache files. For a requirement without extras, this will return, for example:
+        Given a requirement, return its cache key.
+
+        This behavior is a little weird
+        in order to allow backwards compatibility with cache files. For a requirement
+        without extras, this will return, for example:
 
         ("ipython", "2.1.0")
 
-        For a requirement with extras, the extras will be comma-separated and appended to the version, inside brackets,
-        like so:
+        For a requirement with extras, the extras will be comma-separated and appended
+        to the version, inside brackets, like so:
 
         ("ipython", "2.1.0[nbconvert,notebook]")
         """
@@ -85,50 +110,38 @@ class DependencyCache(object):
         if not extras:
             extras_string = ""
         else:
-            extras_string = "[{}]".format(",".join(extras))
-        return name, "{}{}".format(version, extras_string)
+            extras_string = f"[{','.join(extras)}]"
+        return name, f"{version}{extras_string}"
 
-    def read_cache(self):
-        """Reads the cached contents into memory."""
-        if os.path.exists(self._cache_file):
-            self._cache = read_cache_file(self._cache_file)
-        else:
-            self._cache = {}
-
-    def write_cache(self):
-        """Writes the cache to disk as JSON."""
-        doc = {
-            '__format__': 1,
-            'dependencies': self._cache,
-        }
-        with open(self._cache_file, 'w') as f:
+    def write_cache(self) -> None:
+        """Write the cache to disk as JSON."""
+        doc = {"__format__": 1, "dependencies": self._cache}
+        with open(self._cache_file, "w", encoding="utf-8") as f:
             json.dump(doc, f, sort_keys=True)
 
-    def clear(self):
+    def clear(self) -> None:
         self._cache = {}
         self.write_cache()
 
-    def __contains__(self, ireq):
+    def __contains__(self, ireq: InstallRequirement) -> bool:
         pkgname, pkgversion_and_extras = self.as_cache_key(ireq)
         return pkgversion_and_extras in self.cache.get(pkgname, {})
 
-    def __getitem__(self, ireq):
+    def __getitem__(self, ireq: InstallRequirement) -> list[str]:
         pkgname, pkgversion_and_extras = self.as_cache_key(ireq)
         return self.cache[pkgname][pkgversion_and_extras]
 
-    def __setitem__(self, ireq, values):
+    def __setitem__(self, ireq: InstallRequirement, values: list[str]) -> None:
         pkgname, pkgversion_and_extras = self.as_cache_key(ireq)
         self.cache.setdefault(pkgname, {})
         self.cache[pkgname][pkgversion_and_extras] = values
         self.write_cache()
 
-    def get(self, ireq, default=None):
-        pkgname, pkgversion_and_extras = self.as_cache_key(ireq)
-        return self.cache.get(pkgname, {}).get(pkgversion_and_extras, default)
-
-    def reverse_dependencies(self, ireqs):
+    def reverse_dependencies(
+        self, ireqs: Iterable[InstallRequirement]
+    ) -> dict[str, set[str]]:
         """
-        Returns a lookup table of reverse dependencies for all the given ireqs.
+        Return a lookup table of reverse dependencies for all the given ireqs.
 
         Since this is all static, it only works if the dependency cache
         contains the complete data, otherwise you end up with a partial view.
@@ -138,9 +151,11 @@ class DependencyCache(object):
         ireqs_as_cache_values = [self.as_cache_key(ireq) for ireq in ireqs]
         return self._reverse_dependencies(ireqs_as_cache_values)
 
-    def _reverse_dependencies(self, cache_keys):
+    def _reverse_dependencies(
+        self, cache_keys: Iterable[tuple[str, str]]
+    ) -> dict[str, set[str]]:
         """
-        Returns a lookup table of reverse dependencies for all the given cache keys.
+        Return a lookup table of reverse dependencies for all the given cache keys.
 
         Example input:
 
@@ -157,8 +172,10 @@ class DependencyCache(object):
              'pyflakes': ['flake8']}
 
         """
-        # First, collect all the dependencies into a sequence of (parent, child) tuples, like [('flake8', 'pep8'),
-        # ('flake8', 'mccabe'), ...]
-        return lookup_table((key_from_req(Requirement.parse(dep_name)), name)
-                            for name, version_and_extras in cache_keys
-                            for dep_name in self.cache[name][version_and_extras])
+        # First, collect all the dependencies into a sequence of (parent, child)
+        # tuples, like [('flake8', 'pep8'), ('flake8', 'mccabe'), ...]
+        return lookup_table_from_tuples(
+            (key_from_req(Requirement(dep_name)), name)
+            for name, version_and_extras in cache_keys
+            for dep_name in self.cache[name][version_and_extras]
+        )

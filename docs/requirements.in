@@ -1,0 +1,9 @@
+furo
+myst-parser >= 5.1.0  # alert ext for GFM support
+setuptools-scm
+sphinx
+sphinxcontrib-apidoc
+sphinxcontrib-programoutput
+sphinxcontrib-towncrier
+sphinx-issues
+sphinx-design

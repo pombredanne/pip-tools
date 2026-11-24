@@ -1,97 +1,643 @@
-import json
-from functools import partial
+from __future__ import annotations
 
+import collections.abc as _c
+import functools
+import json
+import os
+import platform
+import shlex
+import shutil
+import subprocess
+import sys
+import textwrap
+import typing as _t
+from contextlib import contextmanager
+from dataclasses import dataclass, field
+from pathlib import Path
+from unittest import mock
+
+import click.testing
+import pytest
+import tomli_w
+from pip._internal.commands.install import InstallCommand
+from pip._internal.index.package_finder import PackageFinder
+from pip._internal.models.candidate import InstallationCandidate
+from pip._internal.models.link import Link
+from pip._internal.network.session import PipSession
+from pip._internal.req.constructors import (
+    install_req_from_editable,
+    install_req_from_line,
+)
+from pip._internal.utils.direct_url_helpers import direct_url_from_link
 from pip._vendor.packaging.version import Version
 from pip._vendor.pkg_resources import Requirement
-from pip.req import InstallRequirement
-from pytest import fixture
 
+from piptools._compat import Distribution
+from piptools._internal import _pip_api
 from piptools.cache import DependencyCache
+from piptools.exceptions import NoCandidateFound
+from piptools.locations import DEFAULT_CONFIG_FILE_NAMES
+from piptools.logging import log
+from piptools.repositories import PyPIRepository
 from piptools.repositories.base import BaseRepository
-from piptools.resolver import Resolver
-from piptools.utils import as_tuple, key_from_req, make_install_requirement
+from piptools.resolver import BacktrackingResolver, LegacyResolver
+from piptools.utils import (
+    as_tuple,
+    is_url_requirement,
+    key_from_ireq,
+)
+
+from .constants import MINIMAL_WHEELS_PATH, TEST_DATA_PATH
+from .utils import looks_like_ci
+
+
+@dataclass
+class FakeOptions:
+    features_enabled: list[str] = field(default_factory=list)
+    deprecated_features_enabled: list[str] = field(default_factory=list)
+    target_dir: str | None = None
 
 
 class FakeRepository(BaseRepository):
-    def __init__(self):
-        with open('tests/fixtures/fake-index.json', 'r') as f:
+    def __init__(self, options: FakeOptions):
+        self._options = options
+
+        with open(os.path.join(TEST_DATA_PATH, "fake-index.json")) as f:
             self.index = json.load(f)
 
-        with open('tests/fixtures/fake-editables.json', 'r') as f:
+        with open(os.path.join(TEST_DATA_PATH, "fake-editables.json")) as f:
             self.editables = json.load(f)
+
+    def get_hashes(self, ireq):
+        # Some fake hashes
+        return {
+            "test:123",
+            "sha256:0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
+        }
 
     def find_best_match(self, ireq, prereleases=False):
         if ireq.editable:
             return ireq
 
-        versions = ireq.specifier.filter(self.index[key_from_req(ireq.req)], prereleases=prereleases)
+        versions = list(
+            ireq.specifier.filter(
+                self.index[key_from_ireq(ireq)], prereleases=prereleases
+            )
+        )
+        if not versions:
+            tried_versions = [
+                InstallationCandidate(ireq.name, version, "https://fake.url.foo")
+                for version in self.index[key_from_ireq(ireq)]
+            ]
+            raise NoCandidateFound(ireq, tried_versions, ["https://fake.url.foo"])
         best_version = max(versions, key=Version)
-        return make_install_requirement(key_from_req(ireq.req), best_version, ireq.extras)
+        return _pip_api.create_install_requirement(
+            key_from_ireq(ireq), best_version, ireq
+        )
 
     def get_dependencies(self, ireq):
-        if ireq.editable:
+        if ireq.editable or is_url_requirement(ireq):
             return self.editables[str(ireq.link)]
 
         name, version, extras = as_tuple(ireq)
         # Store non-extra dependencies under the empty string
         extras += ("",)
-        dependencies = [dep for extra in extras for dep in self.index[name][version][extra]]
-        return [InstallRequirement.from_line(dep) for dep in dependencies]
+        dependencies = [
+            dep for extra in extras for dep in self.index[name][version][extra]
+        ]
+        return [
+            install_req_from_line(dep, constraint=ireq.constraint)
+            for dep in dependencies
+        ]
+
+    @contextmanager
+    def allow_all_wheels(self):
+        # No need to do an actual pip.Wheel mock here.
+        yield
+
+    @property
+    def options(self):
+        return self._options
+
+    @functools.cached_property
+    def session(self) -> PipSession:
+        return mock.Mock()
+
+    @functools.cached_property
+    def finder(self) -> PackageFinder:
+        return mock.Mock()
+
+    @functools.cached_property
+    def command(self) -> InstallCommand:
+        return mock.Mock()
 
 
-class FakeInstalledDistribution(object):
-    def __init__(self, line, deps=None):
+class PipToolsCliRunner:
+    """
+    A wrapper over click.testing.CliRunner to make invocations simpler.
+
+    Features:
+    - 'pip_sync' and 'pip_compile' aliases for 'invoke'
+    - automatically checks exit codes
+    - accepts a string for args (shlex.split) as a convenience
+    - 'catch_exceptions' defaults to False, not True
+    """
+
+    def __init__(self) -> None:
+        self.click_runner = click.testing.CliRunner()
+
+    def invoke(
+        self,
+        cli_entry_point: click.BaseCommand,
+        args: _c.Sequence[str] | str | None = None,
+        /,
+        *,
+        input: str | None = None,
+        env: _c.Mapping[str, str | None] | None = None,
+        catch_exceptions: bool = False,
+        expect_exit_code: int | None = 0,
+    ) -> click.testing.Result:
+        __tracebackhide__ = True
+
+        if isinstance(args, str):
+            args = shlex.split(args)
+        result = self.click_runner.invoke(
+            cli_entry_point,
+            args,
+            input=input,
+            env=env,
+            catch_exceptions=catch_exceptions,
+        )
+        if expect_exit_code is not None and result.exit_code != expect_exit_code:
+            pytest.fail(
+                f"Expected exit({expect_exit_code}), saw exit({result.exit_code}).\n"
+                "Result:\n"
+                "  stderr:\n"
+                + textwrap.indent(result.stderr, "    ")
+                + "  stdout:\n"
+                + textwrap.indent(result.stdout, "    ")
+            )
+
+        return result
+
+    def pip_sync(
+        self,
+        args: _c.Sequence[str] | str | None = None,
+        /,
+        *,
+        input: str | None = None,
+        env: _c.Mapping[str, str | None] | None = None,
+        catch_exceptions: bool = False,
+        expect_exit_code: int | None = 0,
+    ) -> click.testing.Result:
+        __tracebackhide__ = True
+
+        from piptools.scripts.sync import cli
+
+        return self.invoke(
+            cli,
+            args,
+            input=input,
+            env=env,
+            catch_exceptions=catch_exceptions,
+            expect_exit_code=expect_exit_code,
+        )
+
+    def pip_compile(
+        self,
+        args: _c.Sequence[str] | str | None = None,
+        /,
+        *,
+        input: str | None = None,
+        env: _c.Mapping[str, str | None] | None = None,
+        catch_exceptions: bool = False,
+        expect_exit_code: int | None = 0,
+    ) -> click.testing.Result:
+        __tracebackhide__ = True
+
+        from piptools.scripts.compile import cli
+
+        return self.invoke(
+            cli,
+            args,
+            input=input,
+            env=env,
+            catch_exceptions=catch_exceptions,
+            expect_exit_code=expect_exit_code,
+        )
+
+
+def pytest_collection_modifyitems(config, items):
+    for item in items:
+        # Mark network tests as flaky
+        # marked as no cover because this only applies in CI
+        if item.get_closest_marker("network") and looks_like_ci():  # pragma: no cover
+            item.add_marker(pytest.mark.flaky(reruns=3, reruns_delay=2))
+
+
+@pytest.fixture
+def fake_dist():
+    def _fake_dist(line, deps=None):
         if deps is None:
             deps = []
-        self.deps = [Requirement.parse(d) for d in deps]
+        req = Requirement.parse(line)
+        key = req.name
+        if "==" in line:
+            version = line.split("==")[1]
+        else:
+            version = "0+unknown"
+        requires = [Requirement.parse(d) for d in deps]
+        direct_url = None
+        if req.url:
+            direct_url = direct_url_from_link(Link(req.url))
+        return Distribution(key, version, requires, direct_url)
 
-        self.req = Requirement.parse(line)
-
-        self.key = key_from_req(self.req)
-        self.specifier = self.req.specifier
-
-        self.version = line.split("==")[1]
-
-    def requires(self):
-        return self.deps
-
-    def as_requirement(self):
-        return self.req
-
-
-@fixture
-def fake_dist():
-    return FakeInstalledDistribution
+    return _fake_dist
 
 
-@fixture
+@pytest.fixture
 def repository():
-    return FakeRepository()
+    return FakeRepository(
+        options=FakeOptions(deprecated_features_enabled=["legacy-resolver"])
+    )
 
 
-@fixture
-def depcache(tmpdir):
-    return DependencyCache(str(tmpdir))
+@pytest.fixture
+def pypi_repository(tmp_path):
+    return PyPIRepository(
+        [
+            "--index-url",
+            PyPIRepository.DEFAULT_INDEX_URL,
+            "--use-deprecated",
+            "legacy-resolver",
+        ],
+        cache_dir=(tmp_path / "pypi-repo"),
+    )
 
 
-@fixture
+@pytest.fixture
+def depcache(tmp_path):
+    return DependencyCache(tmp_path / "dep-cache")
+
+
+@pytest.fixture
 def resolver(depcache, repository):
     # TODO: It'd be nicer if Resolver instance could be set up and then
     #       use .resolve(...) on the specset, instead of passing it to
     #       the constructor like this (it's not reusable)
-    return partial(Resolver, repository=repository, cache=depcache)
+    return functools.partial(
+        LegacyResolver, repository=repository, cache=depcache, existing_constraints={}
+    )
 
 
-@fixture
+@pytest.fixture
+def backtracking_resolver(depcache):
+    # TODO: It'd be nicer if Resolver instance could be set up and then
+    #       use .resolve(...) on the specset, instead of passing it to
+    #       the constructor like this (it's not reusable)
+    return functools.partial(
+        BacktrackingResolver,
+        repository=FakeRepository(options=FakeOptions()),
+        cache=depcache,
+        existing_constraints={},
+    )
+
+
+@pytest.fixture
 def base_resolver(depcache):
-    return partial(Resolver, cache=depcache)
+    return functools.partial(LegacyResolver, cache=depcache, existing_constraints={})
 
 
-@fixture
+@pytest.fixture
 def from_line():
-    return InstallRequirement.from_line
+    return install_req_from_line
 
 
-@fixture
+@pytest.fixture
 def from_editable():
-    return InstallRequirement.from_editable
+    return install_req_from_editable
+
+
+@pytest.fixture(scope="session", autouse=True)
+def _isolate_pip_env() -> _c.Iterator[None]:
+    """
+    Automatically drop all ``PIP_*`` environment variables during test execution.
+    """
+    # this is important for direct runs of the testsuite when contributors have
+    # pip configurations in their env (e.g., for corporate index servers)
+    with pytest.MonkeyPatch.context() as mp:
+        # marked as no-cover because there's no guarantee that there are any such vars
+        for env_var in (
+            name for name in os.environ if name.startswith("PIP_")
+        ):  # pragma: no cover
+            mp.delenv(env_var)
+        yield
+
+
+@pytest.fixture
+def tmp_path_cwd(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> _t.Iterator[Path]:
+    """Wrap ``tmp_path`` to also chdir into it."""
+    # use an explicit monkeypatch context, rather than calling monkeypatch.chdir, so
+    # that calls to `monkeypatch.undo()` won't accidentally revert
+    with monkeypatch.context() as mp:
+        mp.chdir(tmp_path)
+        yield tmp_path
+
+
+@pytest.fixture
+def runner(tmp_path_cwd: Path) -> PipToolsCliRunner:
+    return PipToolsCliRunner()
+
+
+@pytest.fixture
+def make_pip_conf(tmp_path, monkeypatch):
+    created_paths = []
+
+    def _make_pip_conf(content):
+        pip_conf_file = "pip.conf" if os.name != "nt" else "pip.ini"
+        path = tmp_path / pip_conf_file
+        path.write_text(content)
+
+        path_str = str(path)
+
+        monkeypatch.setenv("PIP_CONFIG_FILE", path_str)
+
+        created_paths.append(path_str)
+        return path_str
+
+    try:
+        yield _make_pip_conf
+    finally:
+        for path in created_paths:
+            os.remove(path)
+
+
+@pytest.fixture
+def pip_conf(make_pip_conf, minimal_wheels_path):
+    return make_pip_conf(textwrap.dedent(f"""\
+            [global]
+            no-index = true
+            find-links = {minimal_wheels_path.as_posix()}
+            """))
+
+
+@pytest.fixture
+def pip_with_index_conf(make_pip_conf, minimal_wheels_path):
+    return make_pip_conf(textwrap.dedent(f"""\
+            [global]
+            index-url = http://example.com
+            find-links = {minimal_wheels_path.as_posix()}
+            """))
+
+
+@pytest.fixture(scope="session")
+def make_package(tmp_path_factory):
+    """
+    Make a package from a given name, version and list of required packages.
+    """
+
+    def _make_package(
+        name,
+        version="0.1",
+        install_requires=None,
+        extras_require=None,
+        build_system_requires=None,
+    ):
+        if install_requires is None:
+            install_requires = []
+
+        if extras_require is None:
+            extras_require = dict()
+
+        install_requires_str = "[{}]".format(
+            ",".join(f"{package!r}" for package in install_requires)
+        )
+
+        package_dir = tmp_path_factory.mktemp("packages") / name / version
+        package_dir.mkdir(parents=True)
+
+        with (package_dir / "setup.py").open("w") as fp:
+            fp.write(textwrap.dedent(f"""\
+                    from setuptools import setup
+                    setup(
+                        name={name!r},
+                        version={version!r},
+                        author="pip-tools",
+                        author_email="pip-tools@localhost",
+                        url="https://github.com/pypa/pip-tools",
+                        install_requires={install_requires_str},
+                        extras_require={extras_require},
+                        py_modules=[{name!r}],
+                    )
+                    """))
+
+        # Create a README to avoid setuptools warnings.
+        (package_dir / "README").touch()
+
+        # Create a module to make the package importable.
+        (package_dir / name).with_suffix(".py").touch()
+
+        if build_system_requires:
+            with (package_dir / "pyproject.toml").open("w") as fp:
+                fp.write(textwrap.dedent(f"""\
+                        [build-system]
+                        requires = {json.dumps(build_system_requires)}
+                        """))
+
+        return package_dir
+
+    return _make_package
+
+
+@pytest.fixture(scope="session")
+def run_setup_file():
+    """
+    Run a setup.py file from a given package dir.
+    """
+
+    def _run_setup_file(package_dir_path, *args):
+        setup_file = package_dir_path / "setup.py"
+        return subprocess.run(
+            [sys.executable, str(setup_file), *args],
+            cwd=str(package_dir_path),
+            stdout=subprocess.DEVNULL,
+            check=True,
+        )  # nosec
+
+    return _run_setup_file
+
+
+@pytest.fixture(scope="session")
+def make_wheel(run_setup_file):
+    """
+    Make a wheel distribution from a given package dir.
+    """
+
+    def _make_wheel(package_dir, dist_dir, *args):
+        return run_setup_file(
+            package_dir, "bdist_wheel", "--dist-dir", str(dist_dir), *args
+        )
+
+    return _make_wheel
+
+
+@pytest.fixture
+def make_sdist(run_setup_file):
+    """
+    Make a source distribution from a given package dir.
+    """
+
+    def _make_sdist(package_dir, dist_dir, *args):
+        return run_setup_file(package_dir, "sdist", "--dist-dir", str(dist_dir), *args)
+
+    return _make_sdist
+
+
+@pytest.fixture
+def make_module(tmp_path):
+    """
+    Make a metadata file with the given name and content and a fake module.
+    """
+
+    def _make_module(fname, content) -> str:
+        path = tmp_path / "sample_lib"
+        path.mkdir()
+        path = tmp_path / "sample_lib" / "__init__.py"
+        path.write_text("'example module'\n__version__ = '1.2.3'")
+        if fname == "setup.cfg":
+            path = tmp_path / "pyproject.toml"
+            path.write_text(
+                "\n".join(
+                    (
+                        "[build-system]",
+                        'requires = ["setuptools"]',
+                        'build-backend = "setuptools.build_meta"',
+                    )
+                )
+            )
+        path = tmp_path / fname
+        path.write_text(textwrap.dedent(content))
+        return str(path)
+
+    return _make_module
+
+
+@pytest.fixture(scope="session")
+def fake_dists(tmp_path_factory, make_package, make_wheel):
+    """
+    Generate distribution packages `small-fake-*`
+    """
+    dists_path = tmp_path_factory.mktemp("dists")
+    pkgs = [
+        make_package("small-fake-a", version="0.1"),
+        make_package("small-fake-b", version="0.2"),
+        make_package("small-fake-c", version="0.3"),
+    ]
+    for pkg in pkgs:
+        make_wheel(pkg, dists_path)
+    return dists_path
+
+
+@pytest.fixture(scope="session")
+def fake_dists_with_build_deps(tmp_path_factory, make_package, make_wheel):
+    """Generate distribution packages with names that make sense for testing build deps."""
+    dists_path = tmp_path_factory.mktemp("dists")
+    pkgs = [
+        make_package(
+            "fake_static_build_dep",
+            version="0.1",
+            install_requires=["fake_transient_run_dep"],
+            build_system_requires=["fake_transient_build_dep"],
+        ),
+        make_package("fake_dynamic_build_dep_for_all", version="0.2"),
+        make_package("fake_dynamic_build_dep_for_sdist", version="0.3"),
+        make_package("fake_dynamic_build_dep_for_wheel", version="0.4"),
+        make_package("fake_dynamic_build_dep_for_editable", version="0.5"),
+        make_package("fake_direct_runtime_dep", version="0.1"),
+        make_package("fake_direct_extra_runtime_dep", version="0.2"),
+        make_package("fake_transient_build_dep", version="0.3"),
+        make_package("fake_transient_run_dep", version="0.3"),
+    ]
+    for pkg in pkgs:
+        make_wheel(pkg, dists_path)
+    return dists_path
+
+
+@pytest.fixture
+def venv(tmp_path):
+    """Create a temporary venv and get the path of its directory of executables."""
+    subprocess.run(
+        [sys.executable, "-m", "venv", os.fspath(tmp_path)],
+        check=True,
+    )
+    return tmp_path / ("Scripts" if platform.system() == "Windows" else "bin")
+
+
+@pytest.fixture(autouse=True)
+def _reset_log():
+    """
+    Since piptools.logging.log is a global variable we have to restore its initial
+    state. Some tests can change logger verbosity which might cause a conflict
+    with other tests that depend on it.
+    """
+    log.reset()
+
+
+@pytest.fixture
+def make_config_file(tmp_path_cwd):
+    """
+    Make a config file for pip-tools with a given parameter set to a specific
+    value, returning a ``pathlib.Path`` to the config file.
+    """
+
+    def _maker(
+        pyproject_param: str,
+        new_default: _t.Any,
+        config_file_name: str = DEFAULT_CONFIG_FILE_NAMES[0],
+        section: str = "pip-tools",
+        subsection: str | None = None,
+    ) -> Path:
+        # Create a nested directory structure if config_file_name includes directories
+        config_dir = (tmp_path_cwd / config_file_name).parent
+        config_dir.mkdir(exist_ok=True, parents=True)
+
+        # Make a config file with this one config default override
+        config_file = tmp_path_cwd / config_file_name
+
+        nested_config = {pyproject_param: new_default}
+        if subsection:
+            nested_config = {subsection: nested_config}
+        config_to_dump = {"tool": {section: nested_config}}
+        config_file.write_text(tomli_w.dumps(config_to_dump))
+        return _t.cast(Path, config_file.relative_to(tmp_path_cwd))
+
+    return _maker
+
+
+@pytest.fixture(scope="session")
+def setuptools_wheel_path(tmp_path_factory):
+    """
+    Ensure setuptools is downloaded and return the path to the download directory.
+    """
+    tmp_wheels_path = tmp_path_factory.mktemp("tmp_wheels")
+    subprocess.check_call(
+        [
+            sys.executable,
+            "-Im",
+            "pip",
+            "download",
+            f"--dest={tmp_wheels_path.as_posix()}",
+            "--no-deps",
+            "setuptools",
+        ],
+    )
+    return tmp_wheels_path
+
+
+@pytest.fixture(scope="session")
+def minimal_wheels_path(setuptools_wheel_path):
+    """
+    Ensure minimal wheels and setuptools are downloaded and return the path.
+    """
+    shutil.copytree(MINIMAL_WHEELS_PATH, setuptools_wheel_path, dirs_exist_ok=True)
+    return setuptools_wheel_path

@@ -1,0 +1,16 @@
+[run]
+plugins =
+    covdefaults
+    piptools_coverage
+omit =
+    piptools/_compat/*
+    # any local plugins we use aren't part of normal testing/coverage
+    tests/_plugins/*
+
+[report]
+exclude_also =
+    ^\s*pytest\.fail\(
+    ^\s*@pytest\.mark\.xfail
+    ^\s*if _t\.TYPE_CHECKING:
+include = piptools/*, tests/*
+fail_under = 99

@@ -1,24 +1,33 @@
-# coding: utf-8
-from __future__ import (absolute_import, division, print_function,
-                        unicode_literals)
+from __future__ import annotations
 
-from piptools.utils import key_from_req
+import optparse
+import typing as _t
+from collections.abc import Iterator, Mapping
+from contextlib import contextmanager
+
+from pip._internal.commands.install import InstallCommand
+from pip._internal.index.package_finder import PackageFinder
+from pip._internal.network.session import PipSession
+from pip._internal.req import InstallRequirement
+from pip._internal.utils.hashes import FAVORITE_HASH
+
+from .._internal import _pip_api
+from ..utils import as_tuple, key_from_ireq
 from .base import BaseRepository
 
 
-def ireq_satisfied_by_existing_pin(ireq, existing_pin):
+def ireq_satisfied_by_existing_pin(
+    ireq: InstallRequirement, existing_pin: InstallRequirement
+) -> bool:
     """
-    Return True if the given InstallationRequirement is satisfied by the
+    Return :py:data:`True` if the given ``InstallRequirement`` is satisfied by the
     previously encountered version pin.
     """
-    if hasattr(existing_pin.req, 'specs'):
-        # pip < 8.1.2
-        version = existing_pin.req.specs[0][1]
-        return version in ireq.req
-    else:
-        # pip >= 8.1.2
-        version = next(iter(existing_pin.req.specifier)).version
-        return version in ireq.req.specifier
+    version = next(iter(existing_pin.req.specifier)).version
+    result = ireq.req.specifier.contains(
+        version, prereleases=existing_pin.req.specifier.prereleases
+    )
+    return _t.cast(bool, result)
 
 
 class LocalRequirementsRepository(BaseRepository):
@@ -31,35 +40,65 @@ class LocalRequirementsRepository(BaseRepository):
     requirements file, we prefer that version over the best match found in
     PyPI.  This keeps updates to the requirements.txt down to a minimum.
     """
-    def __init__(self, existing_pins, proxied_repository):
+
+    def __init__(
+        self,
+        existing_pins: Mapping[str, InstallRequirement],
+        proxied_repository: BaseRepository,
+        reuse_hashes: bool = True,
+    ):
+        self._reuse_hashes = reuse_hashes
         self.repository = proxied_repository
         self.existing_pins = existing_pins
 
     @property
-    def finder(self):
+    def options(self) -> optparse.Values:
+        return self.repository.options
+
+    @property
+    def finder(self) -> PackageFinder:
         return self.repository.finder
 
     @property
-    def session(self):
+    def session(self) -> PipSession:
         return self.repository.session
 
     @property
-    def DEFAULT_INDEX_URL(self):
-        return self.repository.DEFAULT_INDEX_URL
+    def command(self) -> InstallCommand:
+        """Return an install command instance."""
+        return self.repository.command
 
-    def clear_caches(self):
+    def clear_caches(self) -> None:
         self.repository.clear_caches()
 
-    def freshen_build_caches(self):
-        self.repository.freshen_build_caches()
-
-    def find_best_match(self, ireq, prereleases=None):
-        key = key_from_req(ireq.req)
+    def find_best_match(
+        self, ireq: InstallRequirement, prereleases: bool | None = None
+    ) -> InstallRequirement:
+        key = key_from_ireq(ireq)
         existing_pin = self.existing_pins.get(key)
         if existing_pin and ireq_satisfied_by_existing_pin(ireq, existing_pin):
-            return existing_pin
+            project, version, _ = as_tuple(existing_pin)
+            return _pip_api.create_install_requirement(project, version, ireq)
         else:
             return self.repository.find_best_match(ireq, prereleases)
 
-    def get_dependencies(self, ireq):
+    def get_dependencies(self, ireq: InstallRequirement) -> set[InstallRequirement]:
         return self.repository.get_dependencies(ireq)
+
+    def get_hashes(self, ireq: InstallRequirement) -> set[str]:
+        existing_pin = self._reuse_hashes and self.existing_pins.get(
+            key_from_ireq(ireq)
+        )
+        if existing_pin and ireq_satisfied_by_existing_pin(ireq, existing_pin):
+            hashes = existing_pin.hash_options
+            hexdigests = hashes.get(FAVORITE_HASH)
+            if hexdigests:
+                return {
+                    ":".join([FAVORITE_HASH, hexdigest]) for hexdigest in hexdigests
+                }
+        return self.repository.get_hashes(ireq)
+
+    @contextmanager
+    def allow_all_wheels(self) -> Iterator[None]:
+        with self.repository.allow_all_wheels():
+            yield
